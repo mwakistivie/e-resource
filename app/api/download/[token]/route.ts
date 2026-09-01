@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { getSignedDownloadUrl } from "@/lib/r2";
+import { getSignedDownloadUrl } from "@/lib/storage";
 
 async function loadValidToken(token: string) {
   const dt = await prisma.downloadToken.findUnique({
