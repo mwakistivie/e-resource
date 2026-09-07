@@ -1,0 +1,26 @@
+name: expire-stale-orders
+
+# Vercel's Hobby (free) plan only allows daily cron schedules — this
+# workflow is a free way to run the sweep more often (every 30 min here)
+# without upgrading to Vercel Pro. It just calls the same authenticated
+# route Vercel Cron would call; the route doesn't care who calls it as
+# long as the CRON_SECRET matches.
+#
+# Setup: add CRON_SECRET (same value as in Vercel's env vars) and
+# SITE_URL (e.g. https://e-resource.vercel.app) as repo secrets under
+# Settings -> Secrets and variables -> Actions. If you're already using
+# vercel.json's daily cron, you can delete this workflow instead — pick one.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {} # allows manually triggering a run from the Actions tab
+
+jobs:
+  expire-orders:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call expire-orders endpoint
+        run: |
+          curl -sf -X GET "${{ secrets.SITE_URL }}/api/cron/expire-orders" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}"
