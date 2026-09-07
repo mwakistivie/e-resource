@@ -1,0 +1,203 @@
+// Prisma schema for the educational resource marketplace MVP.
+// DB target: Neon (Postgres, serverless).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL") // Neon: needed for migrations against pooled connections
+}
+
+enum ResourceType {
+  SCHEME_OF_WORK
+  LESSON_PLAN
+  STUDY_NOTES
+  REVISION_MATERIAL
+  REVISION_QUESTIONS
+  EXAMINATION
+  ASSESSMENT_PAPER
+  MARKING_SCHEME
+  WORKSHEET
+  TEACHING_ACTIVITY
+  PRESENTATION
+  EBOOK
+  PAST_PAPER
+  DIGITAL_QUIZ
+  EDUCATIONAL_VIDEO
+  OTHER
+}
+
+enum ResourceStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum OrderStatus {
+  PENDING // order created, STK push sent, awaiting customer PIN + callback
+  PAID
+  FAILED // customer cancelled / insufficient funds / STK push itself failed
+  EXPIRED // never resolved within polling window, treated as abandoned
+}
+
+model Resource {
+  id           String         @id @default(cuid())
+  title        String
+  slug         String         @unique
+  description  String
+  resourceType ResourceType
+  subject      String
+  gradeLevel   String
+  term         String? // nullable: not every resource type is term-bound (e.g. an e-book)
+  priceKsh     Int // stored in whole KSh to avoid float rounding issues
+  fileKey      String? // R2 object key. Null for bundles (they resolve via BundleItem).
+  previewFileKey String? // watermarked single-page PDF preview, publicly accessible pre-purchase
+  fileSizeMb   Float?
+  thumbnailUrl String?
+  isBundle     Boolean        @default(false)
+  status       ResourceStatus @default(DRAFT)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  bundleOf   BundleItem[] @relation("BundleParent")
+  memberOf   BundleItem[] @relation("BundleChild")
+  orders     Order[]
+  orderItems OrderItem[]
+
+  @@index([resourceType, subject, gradeLevel])
+  @@index([status])
+}
+
+// Join table: which individual resources make up a bundle.
+// A bundle Resource (isBundle = true) has no fileKey of its own;
+// downloads are resolved by walking this table at fulfillment time.
+model BundleItem {
+  id               String   @id @default(cuid())
+  bundleResourceId String
+  childResourceId  String
+  bundleResource   Resource @relation("BundleParent", fields: [bundleResourceId], references: [id], onDelete: Cascade)
+  childResource    Resource @relation("BundleChild", fields: [childResourceId], references: [id], onDelete: Restrict)
+
+  @@unique([bundleResourceId, childResourceId])
+}
+
+// Not an auth entity — there are no customer accounts in the MVP.
+// This exists so support/admin can look up "orders by this email" and
+// so we don't repeat name/email/phone validation logic inline in Order.
+model Customer {
+  id        String   @id @default(cuid())
+  name      String
+  email     String
+  phone     String // stored E.164-ish, e.g. 2547XXXXXXXX, validated at input time
+  createdAt DateTime @default(now())
+  orders    Order[]
+
+  @@index([email])
+  @@index([phone])
+}
+
+model Order {
+  id         String      @id @default(cuid())
+  customerId String
+  resourceId String
+  amountKsh  Int
+  status     OrderStatus @default(PENDING)
+
+  // M-Pesa STK Push (Daraja) correlation fields
+  mpesaCheckoutRequestId String? @unique
+  mpesaMerchantRequestId String?
+  mpesaReceiptNumber     String? // only set once ResultCode == 0
+  mpesaResultDesc        String? // human-readable failure reason when not paid
+
+  createdAt DateTime  @default(now())
+  paidAt    DateTime?
+
+  customer      Customer        @relation(fields: [customerId], references: [id])
+  resource      Resource        @relation(fields: [resourceId], references: [id])
+  paymentEvents PaymentEvent[]
+  downloadToken DownloadToken?
+  emailLog      EmailLog[]
+  items         OrderItem[]
+
+  @@index([status])
+  @@index([mpesaCheckoutRequestId])
+}
+
+// Additive schema for future multi-item cart support. The MVP's checkout
+// flow is still strictly single-resource — Order.resourceId/amountKsh
+// remain the source of truth for everything that exists today (download
+// resolution, M-Pesa amount, admin dashboard) — but every order creation
+// path also writes a single matching OrderItem row, so that when cart
+// support eventually lands, it can switch to reading Order.items without
+// a data migration for historical orders. price is a snapshot at purchase
+// time (not a live join to Resource.priceKsh), since Resource prices can
+// change after an order is placed.
+model OrderItem {
+  id         String   @id @default(cuid())
+  orderId    String
+  resourceId String
+  price      Int
+  createdAt  DateTime @default(now())
+
+  order    Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  resource Resource @relation(fields: [resourceId], references: [id])
+
+  @@index([orderId])
+}
+
+// Audit log of every raw M-Pesa callback we receive, including duplicates.
+// This is the idempotency safety net — never trust a callback blindly,
+// always check whether we've already transitioned this order to PAID.
+model PaymentEvent {
+  id         String   @id @default(cuid())
+  orderId    String
+  rawPayload Json
+  resultCode Int?
+  receivedAt DateTime @default(now())
+
+  order Order @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+}
+
+// The link emailed to the customer. It resolves to a fresh, short-lived
+// R2 signed URL on each click rather than emailing the signed URL directly,
+// because signed URLs expire in minutes/hours and the email needs to stay
+// usable for days.
+model DownloadToken {
+  id            String    @id @default(cuid())
+  orderId       String    @unique
+  token         String    @unique @default(cuid())
+  expiresAt     DateTime
+  downloadCount Int       @default(0)
+  maxDownloads  Int       @default(10) // generous cap, not one-time-use — see README
+  createdAt     DateTime  @default(now())
+
+  order Order @relation(fields: [orderId], references: [id])
+}
+
+// Lightweight send log so a failed Resend call doesn't silently vanish;
+// admin can see "payment succeeded, email never sent" and manually resend.
+model EmailLog {
+  id        String   @id @default(cuid())
+  orderId   String
+  type      String // "receipt" | "resend"
+  toEmail   String
+  status    String // "sent" | "failed"
+  error     String?
+  sentAt    DateTime @default(now())
+
+  order Order @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+}
+
+model AdminUser {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  createdAt    DateTime @default(now())
+}
