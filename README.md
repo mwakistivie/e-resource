@@ -26,6 +26,108 @@ What still needs a real pass before launch:
    Worth a deliberate upgrade decision before going to production rather than
    picking it up silently.
 
+## Beta free-access mode
+
+Set `BETA_FREE_MODE="true"` in your environment (both locally and in Vercel's
+project settings) to let real users browse and download resources for free
+while M-Pesa credentials are still pending. This skips the STK Push call
+entirely — checkout goes straight to "paid," a download token is issued
+immediately, and the receipt email still sends normally. A visible banner
+appears site-wide so testers know it's temporary, and every beta order is
+tagged `mpesaResultDesc: "BETA_FREE_MODE"` in the database so you can tell
+them apart from real revenue once payments go live.
+
+M-Pesa env vars (`MPESA_CONSUMER_KEY`, etc.) can stay blank while this is on
+— `lib/mpesa.ts` is never called in beta mode. Flip `BETA_FREE_MODE="false"`
+the moment Daraja credentials are ready; no other code changes needed.
+
+## Hardening pass: rate limiting, callback security, cron, cart prep
+
+1. **Rate limiting** — `lib/ratelimit.ts`. `/api/orders` (5/min/IP) and
+   `/api/orders/lookup` (3/min/IP, tighter since it's an enumeration
+   target) are now limited. Uses Upstash Redis when `UPSTASH_REDIS_REST_URL`
+   / `UPSTASH_REDIS_REST_TOKEN` are set (correct across Vercel's multiple
+   serverless instances); falls back to an in-memory limiter otherwise,
+   which only works correctly single-instance — fine for dev, not a real
+   guarantee in production. Get a free Upstash database before real launch
+   traffic.
+
+2. **No more hardcoded admin credentials.** `prisma/seed.ts` now requires
+   `ADMIN_INITIAL_EMAIL` / `ADMIN_INITIAL_PASSWORD` env vars and refuses to
+   run without them. **If you already seeded the old `admin@example.com` /
+   `changeme123` account in production, change that account's password now**
+   — this fix only prevents future re-seeds from using weak defaults, it
+   doesn't retroactively touch an already-seeded database.
+
+3. **M-Pesa callback hardening**, `app/api/mpesa/callback/route.ts`:
+   - Optional shared-secret verification (`MPESA_CALLBACK_SECRET`) —
+     `lib/mpesa.ts` appends it to the callback URL automatically, the
+     webhook checks it. Without this, the endpoint trusts any POST
+     referencing a known `CheckoutRequestID`.
+   - Idempotency is now a genuinely atomic claim (`updateMany` with a
+     `status: { not: "PAID" }` guard) instead of a read-then-write check —
+     closes a real race-condition window where two concurrent duplicate
+     callbacks could both pass a status check and both try to create a
+     `DownloadToken`.
+
+4. **Stale order cleanup** — `app/api/cron/expire-orders/route.ts`, protected
+   by a `CRON_SECRET` bearer token, flips `PENDING` orders older than 30
+   minutes to `EXPIRED`. Wired up two ways:
+   - `vercel.json` — Vercel's built-in Cron. **Note: Vercel's Hobby (free)
+     plan only allows daily schedules** — anything more frequent fails at
+     deploy time — so this runs once a day by default.
+   - `.github/workflows/expire-orders.yml` — a free GitHub Actions
+     alternative that can run every 30 minutes instead, if once-daily
+     cleanup isn't tight enough for you. Pick one; running both is
+     harmless (idempotent) but redundant. Needs `SITE_URL` and
+     `CRON_SECRET` added as GitHub Actions repo secrets.
+
+5. **Cart-prep schema** — an additive `OrderItem` model (see
+   `prisma/schema.prisma` for the full reasoning). Every order now writes
+   one matching `OrderItem` row snapshotting the price at purchase time,
+   alongside the existing `Order.resourceId`/`amountKsh` fields, which
+   remain the source of truth for everything that exists today. This is
+   pure groundwork — no cart UI exists yet — but means a future cart
+   feature won't need a data migration for historical orders.
+
+**New migration needed** (combines this and the previous preview-feature
+column, since neither has been applied yet):
+```bash
+npx prisma migrate dev --name hardening_and_cart_prep
+```
+
+## Updates: thumbnails, PDF previews, curriculum dropdowns
+
+Three things changed since the initial build, all in response to reviewing
+the live deployed site:
+
+1. **Thumbnails are now auto-generated** — `app/api/resources/[id]/thumbnail/route.ts`
+   renders a branded SVG cover on the fly from each resource's title/subject/
+   grade/type. No storage cost, no admin upload step, no schema change needed.
+
+2. **PDF previews.** Uploading a PDF in the admin dashboard now automatically
+   generates a watermarked, single-page preview (via `pdf-lib`, entirely
+   client-side in the browser before upload) that customers can view before
+   paying. This added a `previewFileKey` column to `Resource` — see the
+   "Hardening pass" section below for the migration command (it's combined
+   with a later schema change into one migration).
+   Non-PDF uploads (pptx, docx) don't get a preview yet — silently skipped,
+   not an error.
+
+3. **Subject/grade are now dropdowns**, not free text — `lib/curriculum.ts`
+   is the single canonical list (CBC + secondary: PP1–Grade 9, Form 1–4;
+   full subject list) used by both the admin form and the homepage filters.
+   This fixes a real bug: free-text fields had produced inconsistent casing
+   ("CREATIVE ARTS" vs "Creative Arts") that fragmented the filter dropdown.
+   Existing resources created before this change aren't automatically fixed —
+   the homepage filter matches case-insensitively so old data still filters
+   correctly, but re-editing old resources to use the canonical dropdown
+   values is worth doing when you have a moment.
+
+Also added: a favicon (`app/icon.svg`) and an Open Graph share image
+(`app/opengraph-image.tsx`) so links shared on WhatsApp/Facebook render with
+a proper preview instead of a blank card.
+
 ## Setup
 
 ```bash
